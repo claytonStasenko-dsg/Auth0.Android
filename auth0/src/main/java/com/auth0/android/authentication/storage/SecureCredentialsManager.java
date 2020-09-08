@@ -19,11 +19,14 @@ import com.auth0.android.authentication.AuthenticationException;
 import com.auth0.android.callback.AuthenticationCallback;
 import com.auth0.android.callback.BaseCallback;
 import com.auth0.android.jwt.JWT;
+import com.auth0.android.request.ParameterizableRequest;
 import com.auth0.android.request.internal.GsonProvider;
 import com.auth0.android.result.Credentials;
 import com.google.gson.Gson;
 
 import java.util.Date;
+import java.util.Iterator;
+import java.util.Map;
 
 import static android.text.TextUtils.isEmpty;
 
@@ -126,7 +129,7 @@ public class SecureCredentialsManager {
             return false;
         }
         if (resultCode == Activity.RESULT_OK) {
-            continueGetCredentials(decryptCallback);
+            continueGetCredentials(decryptCallback, null);
         } else {
             decryptCallback.onFailure(new CredentialsManagerException("The user didn't pass the authentication challenge."));
             decryptCallback = null;
@@ -207,6 +210,21 @@ public class SecureCredentialsManager {
         continueGetCredentials(callback);
     }
 
+    public void getCredentials(@NonNull BaseCallback<Credentials, CredentialsManagerException> callback, @Nullable Map<String, String> headers) {
+        if (!hasValidCredentials()) {
+            callback.onFailure(new CredentialsManagerException("No Credentials were previously set."));
+            return;
+        }
+
+        if (authenticateBeforeDecrypt) {
+            Log.d(TAG, "Authentication is required to read the Credentials. Showing the LockScreen.");
+            decryptCallback = callback;
+            activity.startActivityForResult(authIntent, authenticationRequestCode);
+            return;
+        }
+        continueGetCredentials(callback, headers);
+    }
+
     /**
      * Delete the stored credentials
      */
@@ -272,6 +290,71 @@ public class SecureCredentialsManager {
 
         Log.d(TAG, "Credentials have expired. Renewing them now...");
         apiClient.renewAuth(credentials.getRefreshToken()).start(new AuthenticationCallback<Credentials>() {
+            @Override
+            public void onSuccess(Credentials fresh) {
+                //non-empty refresh token for refresh token rotation scenarios
+                String updatedRefreshToken = isEmpty(fresh.getRefreshToken()) ? credentials.getRefreshToken() : fresh.getRefreshToken();
+                Credentials refreshed = new Credentials(fresh.getIdToken(), fresh.getAccessToken(), fresh.getType(), updatedRefreshToken, fresh.getExpiresAt(), fresh.getScope());
+                saveCredentials(refreshed);
+                callback.onSuccess(refreshed);
+                decryptCallback = null;
+            }
+
+            @Override
+            public void onFailure(AuthenticationException error) {
+                callback.onFailure(new CredentialsManagerException("An error occurred while trying to use the Refresh Token to renew the Credentials.", error));
+                decryptCallback = null;
+            }
+        });
+    }
+
+    private void continueGetCredentials(final BaseCallback<Credentials, CredentialsManagerException> callback, @Nullable Map<String, String> headers) {
+        String encryptedEncoded = storage.retrieveString(KEY_CREDENTIALS);
+        byte[] encrypted = Base64.decode(encryptedEncoded, Base64.DEFAULT);
+
+        String json;
+        try {
+            json = new String(crypto.decrypt(encrypted));
+        } catch (IncompatibleDeviceException e) {
+            callback.onFailure(new CredentialsManagerException(String.format("This device is not compatible with the %s class.", SecureCredentialsManager.class.getSimpleName()), e));
+            decryptCallback = null;
+            return;
+        } catch (CryptoException e) {
+            //If keys were invalidated, existing credentials will not be recoverable.
+            clearCredentials();
+            callback.onFailure(new CredentialsManagerException("A change on the Lock Screen security settings have deemed the encryption keys invalid and have been recreated. " +
+                    "Any previously stored content is now lost. Please, try saving the credentials again.", e));
+            decryptCallback = null;
+            return;
+        }
+        final Credentials credentials = gson.fromJson(json, Credentials.class);
+        Long expiresAt = storage.retrieveLong(KEY_EXPIRES_AT);
+        if (isEmpty(credentials.getAccessToken()) && isEmpty(credentials.getIdToken()) || expiresAt == null) {
+            callback.onFailure(new CredentialsManagerException("No Credentials were previously set."));
+            decryptCallback = null;
+            return;
+        }
+        if (expiresAt > getCurrentTimeInMillis()) {
+            callback.onSuccess(credentials);
+            decryptCallback = null;
+            return;
+        }
+        if (credentials.getRefreshToken() == null) {
+            callback.onFailure(new CredentialsManagerException("No Credentials were previously set."));
+            decryptCallback = null;
+            return;
+        }
+
+        ParameterizableRequest<Credentials, AuthenticationException> renewAuthParameterizableRequest = apiClient.renewAuth(credentials.getRefreshToken());
+
+        if (headers != null) {
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                renewAuthParameterizableRequest.addHeader(entry.getKey(), entry.getValue());
+            }
+        }
+
+        Log.d(TAG, "Credentials have expired. Renewing them now...");
+        renewAuthParameterizableRequest.start(new AuthenticationCallback<Credentials>() {
             @Override
             public void onSuccess(Credentials fresh) {
                 //non-empty refresh token for refresh token rotation scenarios
